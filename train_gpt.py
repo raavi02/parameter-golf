@@ -70,6 +70,11 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # Bigram embeddings
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -644,6 +649,33 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
+class BigramHashEmbedding(nn.Module):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
+
 
 class GPT(nn.Module):
     def __init__(
@@ -659,6 +691,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_vocab_size: int,
+        bigram_dim: int
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -688,6 +722,8 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -699,6 +735,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -835,6 +873,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -850,20 +890,27 @@ def main() -> None:
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
-        p
+        p for name, p in block_named_params
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
-        p
+        p for name, p in block_named_params
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if base_model.bigram is not None:
+        scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+    if base_model.bigram is not None:
+        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.bigram.proj is not None:
+            matrix_params.append(base_model.bigram.proj.weight)
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        tok_params,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
