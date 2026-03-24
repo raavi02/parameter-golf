@@ -58,6 +58,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    dyt_alpha_init = float(os.environ.get("DYT_ALPHA_INIT", 0.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -71,9 +72,10 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Bigram embeddings
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-
+    xsa_last_n_layers = int(os.environ.get("XSA_LAST_N_LAYERS", 2))
+    use_normuon = bool(int(os.environ.get("USE_NORMUON", "1")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -92,11 +94,12 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON / NORMUON OPTIMIZER
 # -----------------------------
-# 
+#
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
+# NorMuon paper: https://arxiv.org/abs/2510.05491
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
@@ -173,8 +176,127 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
+class NorMuon(torch.optim.Optimizer):
+    """
+    NorMuon: Muon with neuron-wise (row/col) second-moment normalization.
+    Reference: https://arxiv.org/abs/2510.05491
+    Official implementation: https://github.com/zichongli5/NorMuon
+
+    Key differences from plain Muon:
+      1. After orthogonalization, the update is normalized per-row (if rows >= cols)
+         or per-column (if cols > rows) using an EMA of the second moment.
+      2. The update is rescaled after normalization to preserve the pre-norm RMS,
+         so the effective learning rate stays consistent across steps.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        beta2: float,
+        eps: float,
+        nesterov: bool = True,
+    ):
+        super().__init__(
+            params,
+            dict(
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                beta2=beta2,
+                eps=eps,
+                nesterov=nesterov,
+            ),
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr = group["lr"]
+            momentum = group["momentum"]
+            backend_steps = group["backend_steps"]
+            beta2 = group["beta2"]
+            eps = group["eps"]
+            nesterov = group["nesterov"]
+
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+
+                    # --- Momentum (identical to Muon) ---
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+
+                    # --- Newton-Schulz orthogonalization + scale correction ---
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+
+                    # --- NorMuon: save pre-norm RMS for rescaling later ---
+                    g_prenorm_rms = g.norm() / (g.numel() ** 0.5)
+
+                    # --- Adaptive axis: normalize along the shorter dimension.
+                    #     rows >= cols  →  per-row stat  (average over columns, dim=1)
+                    #     cols >  rows  →  per-col stat  (average over rows,    dim=0)
+                    #
+                    # This matches the official NorMuon implementation which averages
+                    # across columns when m >= n and across rows otherwise.
+                    if g.size(0) >= g.size(1):
+                        stat = g.float().square().mean(dim=1, keepdim=True)
+                        var_key = "row_var"
+                    else:
+                        stat = g.float().square().mean(dim=0, keepdim=True)
+                        var_key = "col_var"
+
+                    if var_key not in state:
+                        state[var_key] = torch.zeros_like(stat)
+                    var = state[var_key]
+                    var.mul_(beta2).add_(stat, alpha=1.0 - beta2)
+                    g = g / (var + eps).sqrt().to(dtype=g.dtype)
+
+                    # --- Rescale to match pre-normalization update magnitude ---
+                    g_postnorm_rms = g.norm() / (g.numel() ** 0.5)
+                    g = g * (g_prenorm_rms / (g_postnorm_rms + eps))
+
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
+
+            if distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            curr = 0
+            for p in params:
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                p.add_(g, alpha=-lr)
+                curr += p.numel()
+
+        return loss
+
+
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -294,7 +416,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear",
     ).split(",")
     if pattern
 )
@@ -428,7 +550,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -502,13 +624,19 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
-class RMSNorm(nn.Module):
-    def __init__(self, eps: float | None = None):
+class DynamicTanh(nn.Module):
+    # DyT from "Transformers without Normalization": tanh(alpha * x) + learned affine on the last dim.
+    def __init__(self, dim: int, alpha_init_value: float = 0.5):
         super().__init__()
-        self.eps = eps
+        self.dim = dim
+        self.alpha_init_value = alpha_init_value
+        self.alpha = nn.Parameter(torch.full((1,), alpha_init_value, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+        x = torch.tanh(self.alpha.to(dtype=x.dtype) * x)
+        return x * self.weight.to(dtype=x.dtype) + self.bias.to(dtype=x.dtype)
 
 
 class CastedLinear(nn.Linear):
@@ -565,6 +693,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        dyt_alpha_init: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -582,16 +711,29 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
+        self.q_norm = DynamicTanh(self.head_dim, alpha_init_value=dyt_alpha_init)
+        self.k_norm = DynamicTanh(self.head_dim, alpha_init_value=dyt_alpha_init)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa = False
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        # Project out the self-value direction per KV group without materializing repeated KV heads.
+        bsz, seqlen, num_heads, head_dim = y.shape
+        num_kv_heads = v.size(2)
+        group = num_heads // num_kv_heads
+        y_grouped = y.reshape(bsz, seqlen, num_kv_heads, group, head_dim)
+        v_norm = F.normalize(v, dim=-1).unsqueeze(-2)
+        proj = (y_grouped * v_norm).sum(dim=-1, keepdim=True) * v_norm
+        return (y_grouped - proj).reshape(bsz, seqlen, num_heads, head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -604,7 +746,10 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = y.transpose(1, 2).contiguous()
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v.transpose(1, 2).contiguous())
+        y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -622,6 +767,18 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SmearGate(nn.Module):
+    """Blend each token embedding with the previous token embedding."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -631,11 +788,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        dyt_alpha_init: float,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn_norm = DynamicTanh(dim, alpha_init_value=dyt_alpha_init)
+        self.mlp_norm = DynamicTanh(dim, alpha_init_value=dyt_alpha_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, dyt_alpha_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -675,8 +833,6 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
-
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -691,8 +847,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        dyt_alpha_init: float,
         bigram_vocab_size: int,
-        bigram_dim: int
+        bigram_dim: int,
+        xsa_last_n_layers: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -704,6 +862,7 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.xsa_last_n_layers = min(max(xsa_last_n_layers, 0), num_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
@@ -714,16 +873,22 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    dyt_alpha_init,
                 )
                 for i in range(num_layers)
             ]
         )
-        self.final_norm = RMSNorm()
+        self.input_norm = DynamicTanh(model_dim, alpha_init_value=dyt_alpha_init)
+        self.final_norm = DynamicTanh(model_dim, alpha_init_value=dyt_alpha_init)
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        
+
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.smear = SmearGate(model_dim)
+        if self.xsa_last_n_layers > 0:
+            for i in range(num_layers - self.xsa_last_n_layers, num_layers):
+                self.blocks[i].attn.use_xsa = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -737,7 +902,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
+        x = self.input_norm(x)
+        x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -873,8 +1039,10 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        dyt_alpha_init=args.dyt_alpha_init,
         bigram_vocab_size=args.bigram_vocab_size,
-        bigram_dim=args.bigram_dim
+        bigram_dim=args.bigram_dim,
+        xsa_last_n_layers=args.xsa_last_n_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -886,21 +1054,20 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - matrix params in transformer blocks use MATRIX_LR via Muon or NorMuon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p for name, p in block_named_params
-        for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p for name, p in block_named_params
-        for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -915,12 +1082,25 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
+
+    # Choose NorMuon or plain Muon based on USE_NORMUON env var.
+    if args.use_normuon:
+        optimizer_muon = NorMuon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            beta2=args.beta2,
+            eps=args.adam_eps,
+        )
+    else:
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
@@ -944,6 +1124,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"norm:DyT alpha_init:{args.dyt_alpha_init}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -954,6 +1135,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"optimizer:{'NorMuon' if args.use_normuon else 'Muon'} beta2:{args.beta2} eps:{args.adam_eps}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
